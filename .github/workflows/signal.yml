@@ -13,7 +13,7 @@ jobs:
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
       TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
-      SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+      SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY_1 }}
 
     steps:
       - name: 拉取代码
@@ -49,7 +49,7 @@ jobs:
       - name: 推送到微信
         if: always()
         env:
-          SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+          SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY_1 }}
         run: |
           if [ -z "$SENDKEY" ]; then
             echo "未配置 SENDKEY，跳过推送"
