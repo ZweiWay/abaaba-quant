@@ -1,16 +1,16 @@
 """
 
-信号推送版 v2（修复版）
+信号推送版 v4（双数据源）
 
 ====================================
 
-相比 v1 的修复：
+数据源策略：
 
-  - 候选池为空时不再 return，会照常写文件（写"无信号"）
+  1. 先用 akshare（免费，无 token）
 
-  - 兜底逻辑更稳健：akshare 失败时使用 5 只固定的活跃 A 股
+  2. akshare 失败 → 自动切换 tushare
 
-  - 加更多异常处理，akshare 升级/接口变化不会让整个脚本崩
+  3. 两个都失败 → 兜底模式，不出任何买卖信号
 
 """
 
@@ -21,19 +21,222 @@ import datetime
 
 import json
 
+import time
 
-try:
 
-    import akshare as ak
+import pandas as pd
 
-    import pandas as pd
 
-except ImportError:
+# ============================================================
 
-    print("需要先安装：pip install akshare pandas")
+# 数据源抽象：akshare / tushare
 
-    raise
+# ============================================================
 
+
+class DataSource:
+
+    """统一的数据源接口"""
+
+    def get_stock_list(self, top_n=20):
+
+        """返回市值最小的 N 只股票，格式: [{'code': '000001', 'name': '平安银行'}, ...]"""
+
+        raise NotImplementedError
+
+
+    def get_history(self, code, days=120):
+
+        """返回最近 N 天日线，格式: DataFrame with 'close' column"""
+
+        raise NotImplementedError
+
+
+    @property
+
+    def name(self):
+
+        raise NotImplementedError
+
+
+
+class AkshareSource(DataSource):
+
+    """akshare 数据源"""
+
+
+    @property
+
+    def name(self):
+
+        return "akshare"
+
+
+    def get_stock_list(self, top_n=20):
+
+        df = ak.stock_zh_a_spot_em()
+
+        # 排除北交所/科创板
+
+        df = df[~df['代码'].str.startswith(('8', '4', '688'))]
+
+        # 排除 ST
+
+        df = df[~df['名称'].str.contains('ST|\\*ST', na=False)]
+
+        # 按市值排序，取最小的 N
+
+        df = df.sort_values('总市值', ascending=True).head(top_n)
+
+        return [
+
+            {"code": row['代码'], "name": row['名称']}
+
+            for _, row in df.iterrows()
+
+        ]
+
+
+    def get_history(self, code, days=120):
+
+        end_date = datetime.date.today().strftime("%Y%m%d")
+
+        start_date = (datetime.date.today() - datetime.timedelta(days=days*2)).strftime("%Y%m%d")
+
+        df = ak.stock_zh_a_hist(
+
+            symbol=code,
+
+            period="daily",
+
+            start_date=start_date,
+
+            end_date=end_date,
+
+            adjust="qfq"
+
+        )
+
+        if df is None or len(df) == 0:
+
+            return None
+
+        df = df.rename(columns={'收盘': 'close'})
+
+        return df[['close']].tail(days + 5).reset_index(drop=True)
+
+
+
+class TushareSource(DataSource):
+
+    """tushare 数据源（需 token）"""
+
+
+    def __init__(self, token):
+
+        import tushare as ts
+
+        ts.set_token(token)
+
+        self.pro = ts.pro_api()
+
+
+    @property
+
+    def name(self):
+
+        return "tushare"
+
+
+    def get_stock_list(self, top_n=20):
+
+        # tushare 用 daily_basic 取市值
+
+        today = datetime.date.today().strftime("%Y%m%d")
+
+        df = self.pro.daily_basic(
+
+            trade_date=today,
+
+            fields='ts_code,total_mv,name'
+
+        )
+
+        if df is None or len(df) == 0:
+
+            # 如果今天没数据，用最近的
+
+            df = self.pro.daily_basic(
+
+                fields='ts_code,total_mv,name'
+
+            ).sort_values('trade_date', ascending=False).head(top_n * 5)
+
+
+        # 排除北交所/科创板
+
+        df = df[~df['ts_code'].str.startswith(('8', '4', '688'))]
+
+        # 排除 ST
+
+        df = df[~df['name'].str.contains('ST|\\*ST', na=False)]
+
+        # 按市值排序
+
+        df = df.sort_values('total_mv', ascending=True).head(top_n)
+
+
+        result = []
+
+        for _, row in df.iterrows():
+
+            # ts_code 是 000001.SZ 格式，需要转成纯代码
+
+            code = row['ts_code'].split('.')[0]
+
+            result.append({"code": code, "name": row['name']})
+
+        return result
+
+
+    def get_history(self, code, days=120):
+
+        end_date = datetime.date.today().strftime("%Y%m%d")
+
+        start_date = (datetime.date.today() - datetime.timedelta(days=days*2)).strftime("%Y%m%d")
+
+
+        # tushare 需要带后缀
+
+        suffix = '.SH' if code.startswith(('60', '68')) else '.SZ'
+
+        df = self.pro.daily(
+
+            ts_code=code + suffix,
+
+            start_date=start_date,
+
+            end_date=end_date,
+
+            adj='qfq'
+
+        )
+
+        if df is None or len(df) == 0:
+
+            return None
+
+        df = df.sort_values('trade_date', ascending=True).reset_index(drop=True)
+
+        return df[['close']].tail(days + 5).reset_index(drop=True)
+
+
+
+# ============================================================
+
+# 核心扫描逻辑
+
+# ============================================================
 
 
 PARAMS = {
@@ -44,26 +247,60 @@ PARAMS = {
 
     "candidate_pool": 20,
 
-    "max_position_pct": 0.20,
-
-    "stock_pool_size": 5,
-
 }
 
 
-# 兜底股票池（akshare 失败时用）：活跃的小盘股
+TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "")
 
-FALLBACK_STOCKS = [
 
-    "000001", "000002", "000063", "000066", "000100",
 
-    "000157", "000333", "000425", "000538", "000568",
+def get_data_source():
 
-    "000625", "000651", "000725", "000768", "000776",
+    """先试 akshare，失败切 tushare"""
 
-    "000858", "000876", "000938", "000963", "000977",
+    try:
 
-]
+        print("[数据源] 尝试 akshare...")
+
+        src = AkshareSource()
+
+        # 用一个简单调用测试连通性
+
+        src.get_stock_list(top_n=1)
+
+        print(f"   ✅ akshare 可用")
+
+        return src
+
+    except Exception as e:
+
+        print(f"   ❌ akshare 失败: {e}")
+
+
+    if TUSHARE_TOKEN:
+
+        try:
+
+            print("[数据源] 尝试 tushare...")
+
+            src = TushareSource(TUSHARE_TOKEN)
+
+            src.get_stock_list(top_n=1)
+
+            print(f"   ✅ tushare 可用")
+
+            return src
+
+        except Exception as e:
+
+            print(f"   ❌ tushare 失败: {e}")
+
+    else:
+
+        print("   ⚠️ 未配置 TUSHARE_TOKEN，跳过")
+
+
+    return None
 
 
 
@@ -78,208 +315,140 @@ def scan_signals():
     print(f"{'='*60}\n")
 
 
-    # 1. 取候选池
-
-    candidates = []
-
-    candidates_jq = []
-
-    stock_list = None
-
-
-    try:
-
-        print("[步骤 1] 尝试取实时行情...")
-
-        stock_list = ak.stock_zh_a_spot_em()
-
-        print(f"   ✅ 取到 {len(stock_list)} 只")
-
-
-        # 排除北交所/科创板
-
-        stock_list = stock_list[~stock_list['代码'].str.startswith(('8', '4', '688'))]
-
-        # 排除 ST
-
-        stock_list = stock_list[~stock_list['名称'].str.contains('ST|\\*ST', na=False)]
-
-        # 取市值最小的 N 只
-
-        stock_list = stock_list.sort_values('总市值', ascending=True).head(PARAMS["candidate_pool"])
-
-        candidates = stock_list['代码'].tolist()
-
-        candidates_jq = [convert_to_jq_code(c) for c in candidates]
-
-        print(f"✅ 候选池: {len(candidates_jq)} 只")
-
-        print(f"   前 5 只: {candidates_jq[:5]}\n")
-
-    except Exception as e:
-
-        print(f"❌ 取候选池失败: {e}")
-
-        print(f"   ⚠️ 数据源异常，本日不出交易信号，避免误操作")
-
-        candidates = []
-
-        candidates_jq = []
-
-        stock_list = None
-
-        _fallback_mode = True
-
-    else:
-
-        _fallback_mode = False
-
-
-    # 2. 扫每只股票的信号
-
     buy_signals = []
 
     sell_signals = []
 
     no_data = []
 
+    data_source_name = "无"
 
-    if _fallback_mode:
+    fallback_mode = True
 
-        print("🚨 兜底模式：跳过信号扫描，不出任何买卖信号")
 
-        print("   原因：数据源（akshare）异常")
+    # 1. 取数据源
 
-        print("   建议：今日暂停实盘，等数据源恢复后再跑")
+    src = get_data_source()
 
-    elif not candidates:
 
-        print("⚠️ 没有候选股票可扫")
+    if src is None:
+
+        print("🚨 所有数据源都不可用，今日不出信号")
 
     else:
 
-        for i, code_raw in enumerate(candidates):
+        data_source_name = src.name
 
-            try:
-
-                code_jq = candidates_jq[i] if i < len(candidates_jq) else convert_to_jq_code(code_raw)
-
-                end_date = today.strftime("%Y%m%d")
-
-                start_date = (today - datetime.timedelta(days=120)).strftime("%Y%m%d")
+        fallback_mode = False
 
 
-                df = ak.stock_zh_a_hist(
+        # 2. 取候选池
 
-                    symbol=code_raw,
+        try:
 
-                    period="daily",
+            print(f"\n[步骤 2] 用 {src.name} 取候选池...")
 
-                    start_date=start_date,
+            candidates = src.get_stock_list(top_n=PARAMS["candidate_pool"])
 
-                    end_date=end_date,
+            print(f"   ✅ 候选池: {len(candidates)} 只")
 
-                    adjust="qfq"
+            for c in candidates[:3]:
 
-                )
+                print(f"      {c['code']} {c['name']}")
+
+        except Exception as e:
+
+            print(f"   ❌ 取候选池失败: {e}")
+
+            candidates = []
+
+            fallback_mode = True
 
 
-                if df is None or len(df) < PARAMS["slow_window"] + 5:
+        # 3. 扫信号
 
-                    no_data.append(code_raw)
+        if not fallback_mode and candidates:
+
+            print(f"\n[步骤 3] 扫信号...")
+
+            for c in candidates:
+
+                try:
+
+                    df = src.get_history(c['code'], days=PARAMS["slow_window"] + 30)
+
+                    if df is None or len(df) < PARAMS["slow_window"] + 5:
+
+                        no_data.append(c['code'])
+
+                        continue
+
+
+                    close = df['close'].values
+
+                    fast_ma = pd.Series(close).rolling(PARAMS["fast_window"]).mean().values
+
+                    slow_ma = pd.Series(close).rolling(PARAMS["slow_window"]).mean().values
+
+
+                    if pd.isna(fast_ma[-1]) or pd.isna(slow_ma[-1]) or pd.isna(fast_ma[-2]) or pd.isna(slow_ma[-2]):
+
+                        no_data.append(c['code'])
+
+                        continue
+
+
+                    current_price = close[-1]
+
+
+                    # 金叉
+
+                    if fast_ma[-1] > slow_ma[-1] and fast_ma[-2] <= slow_ma[-2]:
+
+                        buy_signals.append({
+
+                            "code": c['code'],
+
+                            "name": c['name'],
+
+                            "price": current_price,
+
+                            "fast_ma": fast_ma[-1],
+
+                            "slow_ma": slow_ma[-1],
+
+                        })
+
+
+                    # 死叉
+
+                    if fast_ma[-1] < slow_ma[-1] and fast_ma[-2] >= slow_ma[-2]:
+
+                        sell_signals.append({
+
+                            "code": c['code'],
+
+                            "name": c['name'],
+
+                            "price": current_price,
+
+                        })
+
+
+                except Exception as e:
+
+                    no_data.append(c['code'])
 
                     continue
 
 
-                close = df['收盘'].values
+    # 4. 打印
 
-                fast_ma = pd.Series(close).rolling(PARAMS["fast_window"]).mean().values
-
-                slow_ma = pd.Series(close).rolling(PARAMS["slow_window"]).mean().values
-
-
-                if pd.isna(fast_ma[-1]) or pd.isna(slow_ma[-1]) or pd.isna(fast_ma[-2]) or pd.isna(slow_ma[-2]):
-
-                    no_data.append(code_raw)
-
-                    continue
-
-
-                current_price = close[-1]
-
-
-                # 金叉
-
-                if fast_ma[-1] > slow_ma[-1] and fast_ma[-2] <= slow_ma[-2]:
-
-                    name = ""
-
-                    try:
-
-                        if stock_list is not None and i < len(stock_list):
-
-                            name = stock_list.iloc[i]['名称']
-
-                    except Exception:
-
-                        pass
-
-                    buy_signals.append({
-
-                        "code": code_jq,
-
-                        "name": name,
-
-                        "price": current_price,
-
-                        "fast_ma": fast_ma[-1],
-
-                        "slow_ma": slow_ma[-1],
-
-                    })
-
-
-                # 死叉
-
-                if fast_ma[-1] < slow_ma[-1] and fast_ma[-2] >= slow_ma[-2]:
-
-                    name = ""
-
-                    try:
-
-                        if stock_list is not None and i < len(stock_list):
-
-                            name = stock_list.iloc[i]['名称']
-
-                    except Exception:
-
-                        pass
-
-                    sell_signals.append({
-
-                        "code": code_jq,
-
-                        "name": name,
-
-                        "price": current_price,
-
-                    })
-
-
-            except Exception as e:
-
-                no_data.append(code_raw)
-
-                continue
-
-
-    # 3. 打印
-
-    print(f"🟢 买入信号 ({len(buy_signals)} 只):")
+    print(f"\n🟢 买入信号 ({len(buy_signals)} 只):")
 
     for s in buy_signals:
 
-        print(f"   买入 {s['code']} {s.get('name', '')}  价格 {s['price']:.2f}  "
+        print(f"   买入 {s['code']} {s['name']}  价格 {s['price']:.2f}  "
 
               f"MA5={s['fast_ma']:.2f}  MA30={s['slow_ma']:.2f}")
 
@@ -292,7 +461,7 @@ def scan_signals():
 
     for s in sell_signals:
 
-        print(f"   卖出 {s['code']} {s.get('name', '')}  价格 {s['price']:.2f}")
+        print(f"   卖出 {s['code']} {s['name']}  价格 {s['price']:.2f}")
 
     if not sell_signals:
 
@@ -301,10 +470,10 @@ def scan_signals():
 
     if no_data:
 
-        print(f"\n⚠️ 数据缺失 {len(no_data)} 只: {no_data[:5]}...")
+        print(f"\n⚠️ 数据缺失 {len(no_data)} 只")
 
 
-    # 4. 写文件（**不管有没有信号都写**，这样后续步骤不会因为找不到文件挂掉）
+    # 5. 写文件（**永远写**，不管有没有信号）
 
     output_file = f"signals_{today.strftime('%Y%m%d')}.txt"
 
@@ -314,16 +483,15 @@ def scan_signals():
 
             f.write(f"信号扫描 @ {today} 15:30\n")
 
+            f.write(f"数据源: {data_source_name}\n")
+
             f.write(f"{'='*60}\n\n")
-
-            f.write(f"候选池: {len(candidates_jq)} 只\n\n")
-
 
             f.write(f"🟢 买入信号 ({len(buy_signals)} 只):\n")
 
             for s in buy_signals:
 
-                f.write(f"  买入 {s['code']} {s.get('name', '')}  "
+                f.write(f"  买入 {s['code']} {s['name']}  "
 
                         f"价格 {s['price']:.2f}  "
 
@@ -338,7 +506,7 @@ def scan_signals():
 
             for s in sell_signals:
 
-                f.write(f"  卖出 {s['code']} {s.get('name', '')}  价格 {s['price']:.2f}\n")
+                f.write(f"  卖出 {s['code']} {s['name']}  价格 {s['price']:.2f}\n")
 
             if not sell_signals:
 
@@ -348,17 +516,13 @@ def scan_signals():
             f.write(f"\n⚠️ 数据缺失: {len(no_data)} 只\n")
 
 
-            if _fallback_mode:
+            if fallback_mode:
 
                 f.write(f"\n{'='*60}\n")
 
-                f.write(f"🚨 警告：今日为兜底模式，未生成交易信号\n")
+                f.write(f"🚨 兜底模式：所有数据源都不可用，未生成交易信号\n")
 
-                f.write(f"原因：数据源（akshare）异常，无法取到小市值候选池\n")
-
-                f.write(f"建议：今日暂停实盘，勿依据本推送下单\n")
-
-                f.write(f"操作：1) 检查 akshare 版本；2) 隔日重试；3) 连续 3 天异常可考虑换 Tushare\n")
+                f.write(f"建议：今日暂停实盘\n")
 
                 f.write(f"{'='*60}\n")
 
@@ -370,41 +534,25 @@ def scan_signals():
         print(f"\n❌ 写文件失败: {e}")
 
 
-    # 5. 操作建议
+    print(f"\n👉 数据源: {data_source_name} | "
 
-    print(f"\n👉 交易操作建议:")
-
-    if buy_signals:
-
-        print(f"   1. 打开券商 APP")
-
-        print(f"   2. 对每只买入信号：买入金额 = 总资金 × 20%")
-
-    else:
-
-        print(f"   1. 今天无买入信号 → 不操作")
-
-    if sell_signals:
-
-        print(f"   3. 持仓中有卖出信号 → 在 APP 中卖出")
-
-    print()
-
-
-
-def convert_to_jq_code(code):
-
-    if code.startswith(('60', '68')):
-
-        return f"{code}.XSHG"
-
-    else:
-
-        return f"{code}.XSHE"
+          f"买入 {len(buy_signals)} 只, 卖出 {len(sell_signals)} 只")
 
 
 
 if __name__ == "__main__":
 
-    scan_signals()
+    # 延迟 import akshare/tushare（如果没装不立即报错）
 
+    try:
+
+        import akshare as ak
+
+    except ImportError:
+
+        ak = None
+
+        print("⚠️ akshare 未安装")
+
+
+    scan_signals()
